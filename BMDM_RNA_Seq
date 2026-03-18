@@ -1,5 +1,5 @@
 ---
-RNA_Seq_for_BMDMs
+title: "BMDM_RNA_seq"
 ---
 
 ```{r setup-install, eval=FALSE}
@@ -145,99 +145,14 @@ dds_mouse <- DESeq(dds_mouse)
 resultsNames(dds_mouse)
 ```
 
-```{r pca-mouse}
-meta_mouse <- meta[match(colnames(dds_mouse), meta$Sample), ]
-stopifnot(all(meta_mouse$Sample == colnames(dds_mouse)))
-
-vsd_mouse <- vst(dds_mouse, blind = FALSE)
-vsd_mat <- assay(vsd_mouse)
-
-pcaData_mouse <- plotPCA(vsd_mouse, intgroup = "Condition", returnData = TRUE)
-percentVar_mouse <- round(100 * attr(pcaData_mouse, "percentVar"))
-
-p_pca <- ggplot(pcaData_mouse, aes(PC1, PC2, color = Condition, label = name)) +
-  geom_point(size = 4) +
-  geom_text(vjust = -1, size = 3) +
-  xlab(paste0("PC1: ", percentVar_mouse[1], "%")) +
-  ylab(paste0("PC2: ", percentVar_mouse[2], "%")) +
-  theme_bw()
-
-p_pca
-ggsave(
-  file.path(results_dir, "mouse_PCA_all4groups.pdf"),
-  plot = p_pca,
-  width = 7,
-  height = 5
-)
-```
-
-```{r apc-heatmap}
+```{r vst-expr}
 vsd <- vst(dds_mouse, blind = TRUE)
-
 expr <- assay(vsd)
-
-apc_genes <- c(
-  "H2-K1","H2-D1","B2m","Tap1","Tap2","Tapbp","Erap1","Psmb8","Psmb9","Psmb10",
-  "H2-Aa","H2-Ab1","H2-Eb1","H2-DMa","H2-DMb1","H2-DMb2","Cd74","Ciita",
-  "Ctss","Ctsb","Ctsl","Ctsz","Lgmn","Ifi30",
-  "Cd40","Cd80","Cd86","Cd83","Cd70",
-  "Icosl","Tnfsf9","Tnfsf4",
-  "Cd274","Pdcd1lg2",
-  "Il12a","Il12b","Tnf","Il6"
-)
-
 sample_cols <- paste0("A", 1:12)
 
 expr_df <- as.data.frame(expr)
 expr_df$Geneid <- rownames(expr_df)
 expr_df$GeneName <- gene_map$GeneName[match(expr_df$Geneid, gene_map$Geneid)]
-
-apc_df <- expr_df[expr_df$GeneName %in% apc_genes, ]
-apc_df <- apc_df[!is.na(apc_df$GeneName) & apc_df$GeneName != "", ]
-
-apc_df$mean_expr <- rowMeans(apc_df[, sample_cols], na.rm = TRUE)
-apc_df <- apc_df[order(apc_df$GeneName, -apc_df$mean_expr), ]
-apc_df <- apc_df[!duplicated(apc_df$GeneName), ]
-
-rownames(apc_df) <- apc_df$GeneName
-apc_expr <- apc_df[, sample_cols]
-apc_expr[] <- lapply(apc_expr, as.numeric)
-
-apc_avg <- data.frame(
-  isotype = rowMeans(apc_expr[, c("A1","A2","A3")], na.rm = TRUE),
-  WT = rowMeans(apc_expr[, c("A4","A5","A6")], na.rm = TRUE),
-  WT_Exatecan = rowMeans(apc_expr[, c("A7","A8","A9")], na.rm = TRUE),
-  WT_MMAE = rowMeans(apc_expr[, c("A10","A11","A12")], na.rm = TRUE)
-)
-
-rownames(apc_avg) <- rownames(apc_expr)
-
-apc_avg <- apc_avg[apply(apc_avg, 1, sd) > 0, , drop = FALSE]
-apc_scaled <- t(scale(t(apc_avg)))
-apc_scaled <- apc_scaled[complete.cases(apc_scaled), , drop = FALSE]
-
-hm <- pheatmap(
-  apc_scaled,
-  cluster_rows = TRUE,
-  cluster_cols = FALSE,
-  fontsize_row = 8,
-  main = "Antigen Presentation / APC Activation Genes"
-)
-
-print(hm)
-
-tiff(
-  file.path(results_dir, "apc_heatmap.tiff"),
-  width = 1400, height = 1800, res = 180
-)
-pheatmap(
-  apc_scaled,
-  cluster_rows = TRUE,
-  cluster_cols = FALSE,
-  fontsize_row = 8,
-  main = "Antigen Presentation / APC Activation Genes"
-)
-dev.off()
 ```
 
 ```{r helper-functions}
@@ -552,7 +467,7 @@ dev.off()
 
 ---
 
-## Supplemental: WT_MMAE vs. WT_Exatecan – Reactome & Volcano
+## Supplemental
 
 ```{r supp-reactome-mmae}
 # Supplemental: Reactome bar plot for WT_MMAE vs. WT_Exatecan
@@ -609,70 +524,6 @@ ggplot(react_mmae_plot_df, aes(x = pathway_label, y = logFDR)) +
   )
 
 dev.off()
-```
-
-```{r supp-volcano-exa-vs-mmae}
-# Supplemental: Volcano plot for WT_Exatecan vs. WT_MMAE
-# Positive LFC = higher in WT_Exatecan; negative LFC = higher in WT_MMAE
-
-res_exa_vs_mmae <- results(
-  dds_mouse,
-  contrast = c("Condition", "WT_Exatecan", "WT_MMAE")
-)
-
-res_exa_vs_mmae_df <- as.data.frame(res_exa_vs_mmae)
-res_exa_vs_mmae_df$Geneid <- rownames(res_exa_vs_mmae_df)
-
-res_exa_vs_mmae_df$Geneid_clean <- sub("^mouse_", "", res_exa_vs_mmae_df$Geneid)
-res_exa_vs_mmae_df$Geneid_clean <- sub("\\..*$", "", res_exa_vs_mmae_df$Geneid_clean)
-
-res_exa_vs_mmae_df$SYMBOL <- mapIds(
-  org.Mm.eg.db,
-  keys      = res_exa_vs_mmae_df$Geneid_clean,
-  column    = "SYMBOL",
-  keytype   = "ENSEMBL",
-  multiVals = "first"
-)
-
-res_exa_vs_mmae_df$label <- ifelse(
-  is.na(res_exa_vs_mmae_df$SYMBOL),
-  res_exa_vs_mmae_df$Geneid_clean,
-  res_exa_vs_mmae_df$SYMBOL
-)
-
-res_exa_vs_mmae_df <- res_exa_vs_mmae_df[order(res_exa_vs_mmae_df$label, res_exa_vs_mmae_df$padj, na.last = TRUE), ]
-res_exa_vs_mmae_df <- res_exa_vs_mmae_df[!duplicated(res_exa_vs_mmae_df$label), ]
-rownames(res_exa_vs_mmae_df) <- res_exa_vs_mmae_df$label
-
-p_vol_exa_mmae <- EnhancedVolcano(
-  res_exa_vs_mmae_df,
-  lab             = rownames(res_exa_vs_mmae_df),
-  x               = "log2FoldChange",
-  y               = "padj",
-  title           = "WT_Exatecan vs. WT_MMAE",
-  subtitle        = "Positive LFC = higher in WT_Exatecan",
-  pCutoff         = 0.05,
-  FCcutoff        = 0.5,
-  pointSize       = 2,
-  labSize         = 3,
-  col             = c("grey70", "grey70", "#3B7DC6", "#C65D3B"),
-  colAlpha        = 0.6,
-  legendPosition  = "right",
-  drawConnectors  = TRUE,
-  widthConnectors = 0.4,
-  max.overlaps    = 20
-)
-
-p_vol_exa_mmae
-
-ggsave(
-  file.path(results_dir, "Supp_Volcano_WT_Exatecan_vs_WT_MMAE.tiff"),
-  plot        = p_vol_exa_mmae,
-  width       = 9,
-  height      = 7,
-  dpi         = 600,
-  compression = "lzw"
-)
 ```
 
 ```{r supp-volcano-wt-vs-isotype-complement}
