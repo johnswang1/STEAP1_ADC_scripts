@@ -1,0 +1,154 @@
+/**
+ * Pixelwise H-score Quantification for DAB-stained IHC (QuPath Script)
+ *
+ * Computes a pixelwise H-score for immunohistochemical DAB staining within
+ * annotated tumor regions using color deconvolution and sequential pixel
+ * classification at three intensity thresholds (1+, 2+, 3+).
+ *
+ * The H-score is calculated as:
+ *   H-score = (Area_1+ + Area_2+ + Area_3+) / Area_Total × 100
+ *
+ * where areas are derived from cumulative DAB intensity thresholds. This is
+ * mathematically equivalent to the standard weighted formula:
+ *   H-score = 1×(%1+) + 2×(%2+) + 3×(%3+)
+ * with a valid range of 0–300 (maximum when all pixels score 3+).
+ *
+ * Reference:
+ *   Ram S, et al. Pixelwise H-score: A novel digital image analysis-based
+ *   metric to quantify membrane biomarker expression from immunohistochemistry
+ *   images. PLoS One. 2021;16(1):e0245638.
+ *   https://doi.org/10.1371/journal.pone.0245638
+ *
+ * Requirements:
+ *   - QuPath v0.4.x or later
+ *   - H&DAB color deconvolution stains must be configured before running
+ *     (Analyze > Preprocessing > Estimate stain vectors)
+ *   - Tumor regions must be annotated and assigned the class defined in annotClass
+ *
+ * Usage:
+ *   1. Configure H&DAB stain vectors via Analyze > Preprocessing > Estimate stain vectors
+ *   2. Annotate tumor regions and assign the class specified in annotClass below
+ *   3. Run script; H-scores are written to annotation measurements as 'Pixelwise H-score'
+ *
+ * @author  [Author Name]
+ * @version 1.0
+ */
+
+import qupath.lib.images.servers.PixelCalibration
+import qupath.opencv.ml.pixel.PixelClassifiers
+import qupath.opencv.ops.ImageOps
+import java.nio.file.Path
+import static qupath.lib.gui.scripting.QPEx.*
+
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+// DAB optical density thresholds defining 1+, 2+, and 3+ staining intensity
+def DABthresholds = [0.1, 0.2, 0.4]
+
+// Hematoxylin optical density threshold for identifying nucleated cells (denominator)
+double Hthreshold = 0.08
+
+// Spatial downsampling scale factor (increase for faster processing; 1 = full resolution)
+double scale = 1.0
+
+// Annotation class to process
+def annotClass = "Tumor"
+
+// ── Validate stain configuration ──────────────────────────────────────────────
+
+def stains = imageData.getColorDeconvolutionStains()
+if (stains == null) {
+    print("ERROR: No color deconvolution stains found. " +
+          "Configure H&DAB stain vectors via Analyze > Preprocessing > Estimate stain vectors.")
+    return
+}
+print("Stain vectors loaded — Hematoxylin: " + stains.getStain(1) + ", DAB: " + stains.getStain(2))
+
+// ── Retrieve annotated tumor regions ──────────────────────────────────────────
+
+def annots = getAnnotationObjects().findAll { it.getPathClass() == getPathClass(annotClass) }
+if (annots.isEmpty()) {
+    print("ERROR: No annotations found with class '" + annotClass + "'. " +
+          "Classes present: " + getAnnotationObjects().collect { it.getPathClass() }.unique())
+    return
+}
+print("Processing " + annots.size() + " annotation(s) with class '" + annotClass + "'.")
+
+// ── Initialise pixel classifier output directory ───────────────────────────────
+
+String classifierDir = buildFilePath(PROJECT_BASE_DIR, 'classifiers', 'pixel_classifiers')
+mkdirs(classifierDir)
+
+PixelCalibration cal = imageData.getServer().getPixelCalibration()
+
+// ── Build and apply cumulative DAB intensity classifiers (1+, 2+, 3+) ─────────
+
+String[] intensityLabels  = ["1+", "2+", "3+"]
+String[] classifierFiles  = ["1.json", "2.json", "3.json"]
+
+for (int i = 0; i < 3; i++) {
+    def ops = [
+        ImageOps.Channels.deconvolve(stains),
+        ImageOps.Channels.extract(1),                       // DAB channel (index 1)
+        ImageOps.Threshold.threshold(DABthresholds[i])
+    ]
+    def op          = ImageOps.buildImageDataOp().appendOps(*ops)
+    def classMap    = Map.of(1, getPathClass(intensityLabels[i]))
+    def classifier  = PixelClassifiers.createClassifier(op, cal.createScaledInstance(scale, scale), classMap)
+
+    Path outPath = Path.of(classifierDir, classifierFiles[i])
+    PixelClassifiers.writeClassifier(classifier, outPath)
+
+    selectObjectsByClassification(annotClass)
+    addPixelClassifierMeasurements((i + 1).toString(), (i + 1).toString())
+    print("Classifier " + intensityLabels[i] + " saved and measurements recorded.")
+}
+
+// ── Build and apply combined H+DAB classifier (total stained area denominator) ─
+
+def hdabOps = [
+    ImageOps.Channels.deconvolve(stains),
+    ImageOps.Channels.extract(0, 1),                        // Hematoxylin (0) and DAB (1)
+    ImageOps.Threshold.threshold(Hthreshold, DABthresholds[0]),
+    ImageOps.Channels.maximum()
+]
+def hdabOp         = ImageOps.buildImageDataOp().appendOps(*hdabOps)
+def hdabClassMap   = Map.of(1, getPathClass('HDAB'))
+def hdabClassifier = PixelClassifiers.createClassifier(hdabOp, cal.createScaledInstance(scale, scale), hdabClassMap)
+
+Path hdabPath = Path.of(classifierDir, 'HDAB.json')
+PixelClassifiers.writeClassifier(hdabClassifier, hdabPath)
+
+selectObjectsByClassification(annotClass)
+addPixelClassifierMeasurements("HDAB", "HDAB")
+print("HDAB denominator classifier saved and measurements recorded.")
+
+// ── Calculate pixelwise H-score for each annotation ───────────────────────────
+
+annots.each { annot ->
+    def names = annot.getMeasurementList().getMeasurementNames()
+
+    // Dynamically resolve measurement key names (QuPath appends classifier name and units)
+    def area1Key = names.find { it.contains("1:") && it.toLowerCase().contains("area") }
+    def area2Key = names.find { it.contains("2:") && it.toLowerCase().contains("area") }
+    def area3Key = names.find { it.contains("3:") && it.toLowerCase().contains("area") }
+    def denomKey = names.find { it.contains("HDAB:") && it.toLowerCase().contains("area") }
+
+    double area1 = area1Key ? (double) annot.measurements[area1Key] : 0.0
+    double area2 = area2Key ? (double) annot.measurements[area2Key] : 0.0
+    double area3 = area3Key ? (double) annot.measurements[area3Key] : 0.0
+    double denom = denomKey ? (double) annot.measurements[denomKey] : 0.0
+
+    if (denom > 0) {
+        // Pixelwise H-score: cumulative areas sum to the weighted equivalent
+        // of 1×(%1+) + 2×(%2+) + 3×(%3+); range 0–300
+        double hscore = (area1 + area2 + area3) / denom * 100.0
+        annot.measurements['Pixelwise H-score'] = hscore
+        print("Annotation '" + annot.getName() + "': Pixelwise H-score = " + String.format("%.2f", hscore))
+    } else {
+        annot.measurements['Pixelwise H-score'] = 0.0
+        print("Warning: Zero denominator for annotation '" + annot.getName() + "'. H-score set to 0.")
+    }
+}
+
+print("\nPixelwise H-score quantification complete.")
