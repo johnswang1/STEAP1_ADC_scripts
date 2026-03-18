@@ -1,0 +1,869 @@
+---
+RNA_Seq_for_BMDMs
+---
+
+```{r setup-install, eval=FALSE}
+# Run this chunk once to install all required packages.
+# Set eval=TRUE the first time, then revert to eval=FALSE.
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+BiocManager::install(c(
+  "Rsubread", "DESeq2", "apeglm", "pheatmap",
+  "EnhancedVolcano", "clusterProfiler", "org.Mm.eg.db", "AnnotationDbi",
+  "rtracklayer", "tximport", "ReactomePA", "enrichplot"
+))
+
+install.packages(c("tidyverse", "readr", "ggplot2", "ggrepel", "stringr", "forcats"))
+```
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(Rsubread)
+library(DESeq2)
+library(apeglm)
+library(pheatmap)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(rtracklayer)
+library(tximport)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(enrichplot)
+library(ReactomePA)
+library(stringr)
+library(forcats)
+library(tidyr)
+```
+
+```{r set-paths}
+# ── USER CONFIGURATION ──────────────────────────────────────────────────────
+# Set project_dir to the root of the repository on your system.
+# If you open this .Rmd from the project root, "." works as-is.
+project_dir   <- "."
+# ────────────────────────────────────────────────────────────────────────────
+
+salmon_dir    <- file.path(project_dir, "salmon")
+reference_dir <- file.path(project_dir, "reference")
+results_dir   <- file.path(project_dir, "results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+meta <- read_csv(file.path(project_dir, "metadata.csv"), show_col_types = FALSE)
+
+meta$Condition <- gsub("-", "_", meta$Condition)
+meta$Condition <- factor(meta$Condition,
+                         levels = c("isotype", "WT", "WT_Exatecan", "WT_MMAE"))
+
+meta <- meta %>% arrange(Sample)
+```
+
+```{r build-salmon-file-list}
+files <- file.path(salmon_dir, meta$Sample, "quant.sf")
+names(files) <- meta$Sample
+
+stopifnot(all(file.exists(files)))
+```
+
+```{r tx2gene-and-tximport}
+gtf <- import(file.path(reference_dir, "human_mouse_combined_txome.gtf"))
+gtf_df <- as.data.frame(gtf)
+
+tx2gene <- gtf_df %>%
+  filter(type == "transcript") %>%
+  select(transcript_id, gene_id) %>%
+  distinct()
+
+gene_map <- gtf_df %>%
+  filter(type == "gene") %>%
+  select(gene_id, gene_name) %>%
+  distinct() %>%
+  rename(Geneid = gene_id, GeneName = gene_name)
+
+txi <- tximport(
+  files,
+  type = "salmon",
+  tx2gene = tx2gene,
+  ignoreTxVersion = TRUE
+)
+
+names(txi)
+dim(txi$counts)
+```
+
+```{r split-human-mouse}
+human_counts <- txi$counts[grepl("^human_", rownames(txi$counts)), , drop = FALSE]
+mouse_counts <- txi$counts[grepl("^mouse_", rownames(txi$counts)), , drop = FALSE]
+
+dim(human_counts)
+dim(mouse_counts)
+
+write.csv(human_counts, file.path(results_dir, "human_counts_from_salmon.csv"))
+write.csv(mouse_counts, file.path(results_dir, "mouse_counts_from_salmon.csv"))
+
+# Species composition check
+species_summary <- tibble(
+  Sample = colnames(txi$counts),
+  human_total = colSums(human_counts),
+  mouse_total = colSums(mouse_counts)
+) %>%
+  mutate(
+    human_fraction = human_total / (human_total + mouse_total),
+    mouse_fraction = mouse_total / (human_total + mouse_total)
+  )
+
+species_summary
+write.csv(species_summary, file.path(results_dir, "species_fraction_summary.csv"), row.names = FALSE)
+```
+
+```{r deseq2-mouse}
+meta_mouse <- meta[match(colnames(mouse_counts), meta$Sample), ]
+
+all(meta_mouse$Sample == colnames(mouse_counts))
+
+coldata_mouse <- data.frame(
+  Condition = meta_mouse$Condition
+)
+
+rownames(coldata_mouse) <- meta_mouse$Sample
+
+coldata_mouse
+
+dds_mouse <- DESeqDataSetFromMatrix(
+  countData = round(mouse_counts),
+  colData   = coldata_mouse,
+  design    = ~ Condition
+)
+
+dds_mouse <- dds_mouse[rowSums(counts(dds_mouse)) >= 10, ]
+
+dds_mouse <- DESeq(dds_mouse)
+resultsNames(dds_mouse)
+```
+
+```{r pca-mouse}
+meta_mouse <- meta[match(colnames(dds_mouse), meta$Sample), ]
+stopifnot(all(meta_mouse$Sample == colnames(dds_mouse)))
+
+vsd_mouse <- vst(dds_mouse, blind = FALSE)
+vsd_mat <- assay(vsd_mouse)
+
+pcaData_mouse <- plotPCA(vsd_mouse, intgroup = "Condition", returnData = TRUE)
+percentVar_mouse <- round(100 * attr(pcaData_mouse, "percentVar"))
+
+p_pca <- ggplot(pcaData_mouse, aes(PC1, PC2, color = Condition, label = name)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -1, size = 3) +
+  xlab(paste0("PC1: ", percentVar_mouse[1], "%")) +
+  ylab(paste0("PC2: ", percentVar_mouse[2], "%")) +
+  theme_bw()
+
+p_pca
+ggsave(
+  file.path(results_dir, "mouse_PCA_all4groups.pdf"),
+  plot = p_pca,
+  width = 7,
+  height = 5
+)
+```
+
+```{r apc-heatmap}
+vsd <- vst(dds_mouse, blind = TRUE)
+
+expr <- assay(vsd)
+
+apc_genes <- c(
+  "H2-K1","H2-D1","B2m","Tap1","Tap2","Tapbp","Erap1","Psmb8","Psmb9","Psmb10",
+  "H2-Aa","H2-Ab1","H2-Eb1","H2-DMa","H2-DMb1","H2-DMb2","Cd74","Ciita",
+  "Ctss","Ctsb","Ctsl","Ctsz","Lgmn","Ifi30",
+  "Cd40","Cd80","Cd86","Cd83","Cd70",
+  "Icosl","Tnfsf9","Tnfsf4",
+  "Cd274","Pdcd1lg2",
+  "Il12a","Il12b","Tnf","Il6"
+)
+
+sample_cols <- paste0("A", 1:12)
+
+expr_df <- as.data.frame(expr)
+expr_df$Geneid <- rownames(expr_df)
+expr_df$GeneName <- gene_map$GeneName[match(expr_df$Geneid, gene_map$Geneid)]
+
+apc_df <- expr_df[expr_df$GeneName %in% apc_genes, ]
+apc_df <- apc_df[!is.na(apc_df$GeneName) & apc_df$GeneName != "", ]
+
+apc_df$mean_expr <- rowMeans(apc_df[, sample_cols], na.rm = TRUE)
+apc_df <- apc_df[order(apc_df$GeneName, -apc_df$mean_expr), ]
+apc_df <- apc_df[!duplicated(apc_df$GeneName), ]
+
+rownames(apc_df) <- apc_df$GeneName
+apc_expr <- apc_df[, sample_cols]
+apc_expr[] <- lapply(apc_expr, as.numeric)
+
+apc_avg <- data.frame(
+  isotype = rowMeans(apc_expr[, c("A1","A2","A3")], na.rm = TRUE),
+  WT = rowMeans(apc_expr[, c("A4","A5","A6")], na.rm = TRUE),
+  WT_Exatecan = rowMeans(apc_expr[, c("A7","A8","A9")], na.rm = TRUE),
+  WT_MMAE = rowMeans(apc_expr[, c("A10","A11","A12")], na.rm = TRUE)
+)
+
+rownames(apc_avg) <- rownames(apc_expr)
+
+apc_avg <- apc_avg[apply(apc_avg, 1, sd) > 0, , drop = FALSE]
+apc_scaled <- t(scale(t(apc_avg)))
+apc_scaled <- apc_scaled[complete.cases(apc_scaled), , drop = FALSE]
+
+hm <- pheatmap(
+  apc_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 8,
+  main = "Antigen Presentation / APC Activation Genes"
+)
+
+print(hm)
+
+tiff(
+  file.path(results_dir, "apc_heatmap.tiff"),
+  width = 1400, height = 1800, res = 180
+)
+pheatmap(
+  apc_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 8,
+  main = "Antigen Presentation / APC Activation Genes"
+)
+dev.off()
+```
+
+```{r helper-functions}
+# Helper: build a condition-averaged, z-scored heatmap matrix from expr_df
+
+make_condition_avg_matrix <- function(df, gene_list, sample_cols) {
+  sub_df <- df[df$GeneName %in% gene_list, , drop = FALSE]
+  sub_df <- sub_df[!is.na(sub_df$GeneName) & sub_df$GeneName != "", , drop = FALSE]
+
+  sub_df$mean_expr_tmp <- rowMeans(sub_df[, sample_cols, drop = FALSE], na.rm = TRUE)
+  sub_df <- sub_df[order(sub_df$GeneName, -sub_df$mean_expr_tmp), , drop = FALSE]
+  sub_df <- sub_df[!duplicated(sub_df$GeneName), , drop = FALSE]
+
+  rownames(sub_df) <- sub_df$GeneName
+
+  expr_mat <- sub_df[, sample_cols, drop = FALSE]
+  expr_mat[] <- lapply(expr_mat, as.numeric)
+  expr_mat <- as.data.frame(expr_mat)
+
+  avg_mat <- data.frame(
+    isotype = rowMeans(expr_mat[, c("A1","A2","A3"), drop = FALSE], na.rm = TRUE),
+    WT = rowMeans(expr_mat[, c("A4","A5","A6"), drop = FALSE], na.rm = TRUE),
+    WT_Exatecan = rowMeans(expr_mat[, c("A7","A8","A9"), drop = FALSE], na.rm = TRUE),
+    WT_MMAE = rowMeans(expr_mat[, c("A10","A11","A12"), drop = FALSE], na.rm = TRUE)
+  )
+
+  rownames(avg_mat) <- rownames(expr_mat)
+  avg_mat
+}
+
+make_condition_heatmap_matrix <- function(df, gene_list, sample_cols) {
+  avg_mat <- make_condition_avg_matrix(df, gene_list, sample_cols)
+  avg_mat <- avg_mat[apply(avg_mat, 1, sd, na.rm = TRUE) > 0, , drop = FALSE]
+  scaled_mat <- t(scale(t(avg_mat)))
+  scaled_mat <- scaled_mat[complete.cases(scaled_mat), , drop = FALSE]
+  scaled_mat
+}
+```
+
+```{r mhc1-heatmap}
+mhc1_genes <- c(
+  "H2-K1","H2-D1","B2m",
+  "Tap1","Tap2","Tapbp",
+  "Psmb8","Psmb9","Psmb10",
+  "Erap1","Nlrc5"
+)
+
+mhc1_scaled <- make_condition_heatmap_matrix(expr_df, mhc1_genes, sample_cols)
+
+pheatmap(
+  mhc1_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 14,
+  cellwidth = 18,
+  main = "MHC-I Antigen Presentation Genes"
+)
+
+tiff(
+  file.path(results_dir, "MHC1_antigen_presentation_heatmap.tiff"),
+  width = 6,
+  height = 6,
+  units = "in",
+  res = 600,
+  compression = "lzw"
+)
+pheatmap(
+  mhc1_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 14,
+  fontsize_col = 12,
+  main = "MHC-I Antigen Presentation Genes",
+  color = colorRampPalette(c("white", "#8B0000"))(100),
+  border_color = NA,
+  cellwidth = 18
+)
+dev.off()
+```
+
+```{r inflammatory-heatmap}
+inflammatory_genes <- c(
+  "Il1b","Il6","Tnf","Il12a","Il12b",
+  "Cxcl9","Cxcl10","Cxcl11",
+  "Ccl2","Ccl3","Ccl4","Ccl5",
+  "Nos2","Ptgs2",
+  "Cd40","Cd80","Cd86"
+)
+
+inflammatory_avg <- make_condition_avg_matrix(expr_df, inflammatory_genes, sample_cols)
+inflammatory_scaled <- make_condition_heatmap_matrix(expr_df, inflammatory_genes, sample_cols)
+
+print(rownames(inflammatory_avg))
+print(setdiff(inflammatory_genes, rownames(inflammatory_avg)))
+print(dim(inflammatory_scaled))
+
+pheatmap(
+  inflammatory_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 14,
+  fontsize_col = 11,
+  cellwidth = 18,
+  main = "Inflammatory Macrophage-Associated Genes"
+)
+
+tiff(
+  file.path(results_dir, "Inflammatory_macrophage_genes_heatmap.tiff"),
+  width = 7,
+  height = 6,
+  units = "in",
+  res = 600,
+  compression = "lzw"
+)
+pheatmap(
+  inflammatory_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 14,
+  fontsize_col = 12,
+  cellwidth = 18,
+  main = "Inflammatory Macrophage-Associated Genes",
+  color = colorRampPalette(c("white", "#8B0000"))(100),
+  border_color = NA
+)
+dev.off()
+```
+
+```{r go-enrichment}
+colnames(dds_mouse)
+colData(dds_mouse)
+as.data.frame(colData(dds_mouse))
+
+res_mmae_vs_exa <- results(
+  dds_mouse,
+  contrast = c("Condition", "WT_MMAE", "WT_Exatecan")
+)
+
+res_mmae_vs_exa <- as.data.frame(res_mmae_vs_exa)
+res_mmae_vs_exa$Geneid <- rownames(res_mmae_vs_exa)
+
+head(res_mmae_vs_exa)
+
+# Convert Ensembl IDs -> Entrez IDs
+res_mmae_vs_exa$Geneid <- sub("^mouse_", "", res_mmae_vs_exa$Geneid)
+res_mmae_vs_exa$Geneid <- sub("\\..*$", "", res_mmae_vs_exa$Geneid)
+res_mmae_vs_exa$ENTREZID <- mapIds(
+  org.Mm.eg.db,
+  keys = res_mmae_vs_exa$Geneid,
+  column = "ENTREZID",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+res_mmae_vs_exa$SYMBOL <- mapIds(
+  org.Mm.eg.db,
+  keys = res_mmae_vs_exa$Geneid,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+sig_up_mmae <- subset(
+  res_mmae_vs_exa,
+  !is.na(padj) &
+  padj < 0.05 &
+  log2FoldChange > 0.5 &
+  !is.na(ENTREZID)
+)
+mmae_genes <- unique(sig_up_mmae$ENTREZID)
+length(mmae_genes)
+
+sig_up_exa <- subset(
+  res_mmae_vs_exa,
+  !is.na(padj) &
+  padj < 0.05 &
+  log2FoldChange < -0.5 &
+  !is.na(ENTREZID)
+)
+exa_genes <- unique(sig_up_exa$ENTREZID)
+length(exa_genes)
+gene_universe <- unique(na.omit(res_mmae_vs_exa$ENTREZID))
+length(gene_universe)
+
+# MMAE-enriched GO terms
+ego_mmae <- enrichGO(
+  gene          = mmae_genes,
+  universe      = gene_universe,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# WT-Exatecan-enriched GO terms
+ego_exa <- enrichGO(
+  gene          = exa_genes,
+  universe      = gene_universe,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+dotplot(
+  ego_mmae,
+  showCategory = 20,
+  title = "GO BP enrichment: WT_MMAE > WT_Exatecan"
+)
+
+dotplot(
+  ego_exa,
+  showCategory = 20,
+  title = "GO BP enrichment: WT_Exatecan > WT_MMAE"
+)
+```
+
+```{r reactome-exa}
+react_exa <- enrichPathway(
+  gene = exa_genes,
+  universe = gene_universe,
+  organism = "mouse",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+react_mmae <- enrichPathway(
+  gene = mmae_genes,
+  universe = gene_universe,
+  organism = "mouse",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+head(as.data.frame(react_exa))
+
+react_df <- as.data.frame(react_exa)
+react_df$logFDR <- -log10(react_df$p.adjust)
+react_df <- react_df[1:10, ]
+
+ggplot(react_df, aes(x = reorder(Description, logFDR), y = logFDR)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = "",
+    y = "-log10(FDR)",
+    title = "WT-Exatecan vs WT-MMAE Reactome pathways"
+  ) +
+  theme_classic(base_size = 14)
+```
+
+```{r reactome-exa-tiff}
+react_plot_df <- as.data.frame(react_exa) %>%
+  filter(!is.na(p.adjust), p.adjust < 0.05) %>%
+  mutate(
+    logFDR = -log10(p.adjust),
+    pathway_label = paste0(Description, " (", ID, ")"),
+    pathway_label = str_wrap(pathway_label, width = 38)
+  ) %>%
+  arrange(desc(logFDR)) %>%
+  slice_head(n = 8) %>%
+  mutate(pathway_label = fct_reorder(pathway_label, logFDR))
+
+ggplot(react_plot_df, aes(x = pathway_label, y = logFDR)) +
+  geom_col(width = 0.7, fill = "#C65D3B") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = expression(-log[10](FDR))
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.y = element_text(size = 10, hjust = 1),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    plot.margin = margin(10, 20, 10, 10)
+  )
+
+tiff(
+  file.path(results_dir, "Reactome_WT_Exatecan_vs_MMAE_with_IDs.tiff"),
+  width = 8,
+  height = 6.2,
+  units = "in",
+  res = 600,
+  compression = "lzw"
+)
+
+ggplot(react_plot_df, aes(x = pathway_label, y = logFDR)) +
+  geom_col(width = 0.7, fill = "#C65D3B") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = expression(-log[10](FDR))
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.y = element_text(size = 10, hjust = 1),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    plot.margin = margin(10, 20, 10, 10)
+  )
+
+dev.off()
+```
+
+---
+
+## Supplemental: WT_MMAE vs. WT_Exatecan – Reactome & Volcano
+
+```{r supp-reactome-mmae}
+# Supplemental: Reactome bar plot for WT_MMAE vs. WT_Exatecan
+# react_mmae was computed above (MMAE-enriched pathways relative to Exatecan)
+
+react_mmae_plot_df <- as.data.frame(react_mmae) %>%
+  filter(!is.na(p.adjust), p.adjust < 0.05) %>%
+  mutate(
+    logFDR = -log10(p.adjust),
+    pathway_label = paste0(Description, " (", ID, ")"),
+    pathway_label = str_wrap(pathway_label, width = 38)
+  ) %>%
+  arrange(desc(logFDR)) %>%
+  slice_head(n = 8) %>%
+  mutate(pathway_label = fct_reorder(pathway_label, logFDR))
+
+# Preview in RStudio
+ggplot(react_mmae_plot_df, aes(x = pathway_label, y = logFDR)) +
+  geom_col(width = 0.7, fill = "#3B7DC6") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = expression(-log[10](FDR)),
+    title = "WT_MMAE vs. WT_Exatecan – Reactome Pathways"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.y  = element_text(size = 10, hjust = 1),
+    axis.text.x  = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    plot.margin  = margin(10, 20, 10, 10)
+  )
+
+# Save high-res TIFF
+tiff(
+  file.path(results_dir, "Supp_Reactome_WT_MMAE_vs_WT_Exatecan.tiff"),
+  width = 8, height = 6.2, units = "in", res = 600, compression = "lzw"
+)
+
+ggplot(react_mmae_plot_df, aes(x = pathway_label, y = logFDR)) +
+  geom_col(width = 0.7, fill = "#3B7DC6") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = expression(-log[10](FDR)),
+    title = "WT_MMAE vs. WT_Exatecan – Reactome Pathways"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.y  = element_text(size = 10, hjust = 1),
+    axis.text.x  = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    plot.margin  = margin(10, 20, 10, 10)
+  )
+
+dev.off()
+```
+
+```{r supp-volcano-exa-vs-mmae}
+# Supplemental: Volcano plot for WT_Exatecan vs. WT_MMAE
+# Positive LFC = higher in WT_Exatecan; negative LFC = higher in WT_MMAE
+
+res_exa_vs_mmae <- results(
+  dds_mouse,
+  contrast = c("Condition", "WT_Exatecan", "WT_MMAE")
+)
+
+res_exa_vs_mmae_df <- as.data.frame(res_exa_vs_mmae)
+res_exa_vs_mmae_df$Geneid <- rownames(res_exa_vs_mmae_df)
+
+res_exa_vs_mmae_df$Geneid_clean <- sub("^mouse_", "", res_exa_vs_mmae_df$Geneid)
+res_exa_vs_mmae_df$Geneid_clean <- sub("\\..*$", "", res_exa_vs_mmae_df$Geneid_clean)
+
+res_exa_vs_mmae_df$SYMBOL <- mapIds(
+  org.Mm.eg.db,
+  keys      = res_exa_vs_mmae_df$Geneid_clean,
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+res_exa_vs_mmae_df$label <- ifelse(
+  is.na(res_exa_vs_mmae_df$SYMBOL),
+  res_exa_vs_mmae_df$Geneid_clean,
+  res_exa_vs_mmae_df$SYMBOL
+)
+
+res_exa_vs_mmae_df <- res_exa_vs_mmae_df[order(res_exa_vs_mmae_df$label, res_exa_vs_mmae_df$padj, na.last = TRUE), ]
+res_exa_vs_mmae_df <- res_exa_vs_mmae_df[!duplicated(res_exa_vs_mmae_df$label), ]
+rownames(res_exa_vs_mmae_df) <- res_exa_vs_mmae_df$label
+
+p_vol_exa_mmae <- EnhancedVolcano(
+  res_exa_vs_mmae_df,
+  lab             = rownames(res_exa_vs_mmae_df),
+  x               = "log2FoldChange",
+  y               = "padj",
+  title           = "WT_Exatecan vs. WT_MMAE",
+  subtitle        = "Positive LFC = higher in WT_Exatecan",
+  pCutoff         = 0.05,
+  FCcutoff        = 0.5,
+  pointSize       = 2,
+  labSize         = 3,
+  col             = c("grey70", "grey70", "#3B7DC6", "#C65D3B"),
+  colAlpha        = 0.6,
+  legendPosition  = "right",
+  drawConnectors  = TRUE,
+  widthConnectors = 0.4,
+  max.overlaps    = 20
+)
+
+p_vol_exa_mmae
+
+ggsave(
+  file.path(results_dir, "Supp_Volcano_WT_Exatecan_vs_WT_MMAE.tiff"),
+  plot        = p_vol_exa_mmae,
+  width       = 9,
+  height      = 7,
+  dpi         = 600,
+  compression = "lzw"
+)
+```
+
+```{r supp-volcano-wt-vs-isotype-complement}
+# Supplemental: WT vs. Isotype volcano with complement genes highlighted
+# Positive LFC = higher in WT; negative LFC = higher in isotype
+# Note: built with ggplot2 directly to avoid an EnhancedVolcano bug where
+# colCustom + drawConnectors triggers a "Viewport has zero dimension(s)" error.
+
+res_wt_vs_iso <- results(
+  dds_mouse,
+  contrast = c("Condition", "WT", "isotype")
+)
+
+res_wt_iso_df <- as.data.frame(res_wt_vs_iso)
+res_wt_iso_df$Geneid <- rownames(res_wt_iso_df)
+
+res_wt_iso_df$Geneid_clean <- sub("^mouse_", "", res_wt_iso_df$Geneid)
+res_wt_iso_df$Geneid_clean <- sub("\\..*$", "", res_wt_iso_df$Geneid_clean)
+
+res_wt_iso_df$SYMBOL <- mapIds(
+  org.Mm.eg.db,
+  keys      = res_wt_iso_df$Geneid_clean,
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+res_wt_iso_df$label <- ifelse(
+  is.na(res_wt_iso_df$SYMBOL),
+  res_wt_iso_df$Geneid_clean,
+  res_wt_iso_df$SYMBOL
+)
+
+res_wt_iso_df <- res_wt_iso_df[order(res_wt_iso_df$label, res_wt_iso_df$padj, na.last = TRUE), ]
+res_wt_iso_df <- res_wt_iso_df[!duplicated(res_wt_iso_df$label), ]
+rownames(res_wt_iso_df) <- res_wt_iso_df$label
+
+complement_genes <- c(
+  "C3", "C4b", "C4a", "C2",
+  "C1qa", "C1qb", "C1qc", "C1r", "C1s",
+  "C3ar1", "C5ar1", "C5ar2",
+  "C6", "C7", "C8a", "C8b", "C9",
+  "Cfb", "Cfd", "Cfh", "Cfi", "Cfp",
+  "Masp1", "Masp2", "Mbl1", "Mbl2",
+  "Serping1", "Cr2",
+  "Cd55", "Cd59a",
+  "Fcna", "Fcnb"
+)
+
+complement_present <- intersect(complement_genes, rownames(res_wt_iso_df))
+
+res_wt_iso_df$log10FC        <- res_wt_iso_df$log2FoldChange / log2(10)
+res_wt_iso_df$neg_log10_padj <- -log10(res_wt_iso_df$padj)
+
+res_wt_iso_df$sig <- ifelse(
+  !is.na(res_wt_iso_df$padj) & res_wt_iso_df$padj < 0.05,
+  "Significant", "NS"
+)
+res_wt_iso_df$sig <- factor(res_wt_iso_df$sig, levels = c("Significant", "NS"))
+
+res_wt_iso_df <- res_wt_iso_df[order(res_wt_iso_df$sig, decreasing = TRUE), ]
+
+res_wt_iso_df$repel_label <- ifelse(
+  res_wt_iso_df$label %in% complement_present &
+  !is.na(res_wt_iso_df$padj) &
+  res_wt_iso_df$padj < 0.05 &
+  res_wt_iso_df$log10FC > 0,
+  res_wt_iso_df$label,
+  ""
+)
+
+p_vol_wt_iso <- ggplot(res_wt_iso_df,
+    aes(x = log10FC, y = neg_log10_padj, color = sig)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_text_repel(
+    aes(label            = repel_label),
+    color                = "black",
+    fontface             = "bold",
+    size                 = 5,
+    segment.color        = "black",
+    segment.size         = 0.4,
+    max.overlaps         = Inf,
+    box.padding          = 1.2,
+    point.padding        = 0.8,
+    min.segment.length   = 0.1,
+    force                = 6,
+    force_pull           = 0.5,
+    show.legend          = FALSE,
+    ylim                 = c(NA, 74)
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("Significant" = "#C65D3B", "NS" = "black"),
+    guide  = guide_legend(override.aes = list(size = 3, alpha = 1))
+  ) +
+  scale_x_continuous(limits = c(-2, 2), expand = expansion(mult = 0.01)) +
+  scale_y_continuous(breaks = seq(0, 75, by = 25)) +
+  coord_cartesian(ylim = c(0, 75)) +
+  labs(
+    title = "WT vs. Isotype",
+    x     = expression(log[10]~"(FC)"),
+    y     = expression(-log[10]~"(FDR)")
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    axis.text       = element_text(size = 13)
+  )
+
+p_vol_wt_iso
+
+ggsave(
+  file.path(results_dir, "Supp_Volcano_WT_vs_Isotype_complement.tiff"),
+  plot        = p_vol_wt_iso,
+  width       = 10,
+  height      = 8,
+  dpi         = 600,
+  compression = "lzw"
+)
+
+# Faceted dot plot of complement gene VST expression across all 4 conditions
+vsd_mat_df <- as.data.frame(assay(vsd_mouse))
+vsd_mat_df$Geneid <- rownames(vsd_mat_df)
+vsd_mat_df$Geneid_clean <- sub("^mouse_", "", vsd_mat_df$Geneid)
+vsd_mat_df$Geneid_clean <- sub("\\..*$", "", vsd_mat_df$Geneid_clean)
+
+vsd_mat_df$SYMBOL <- mapIds(
+  org.Mm.eg.db,
+  keys      = vsd_mat_df$Geneid_clean,
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+comp_vsd <- vsd_mat_df %>%
+  filter(SYMBOL %in% complement_present) %>%
+  mutate(mean_all = rowMeans(across(all_of(paste0("A", 1:12))), na.rm = TRUE)) %>%
+  arrange(SYMBOL, desc(mean_all)) %>%
+  filter(!duplicated(SYMBOL))
+
+sample_condition <- setNames(as.character(meta_mouse$Condition), meta_mouse$Sample)
+
+comp_long <- comp_vsd %>%
+  select(SYMBOL, all_of(paste0("A", 1:12))) %>%
+  pivot_longer(-SYMBOL, names_to = "Sample", values_to = "VST") %>%
+  mutate(
+    Condition = factor(sample_condition[Sample],
+                       levels = c("isotype", "WT", "WT_Exatecan", "WT_MMAE"))
+  )
+
+comp_summary <- comp_long %>%
+  group_by(SYMBOL, Condition) %>%
+  summarise(
+    mean_VST = mean(VST, na.rm = TRUE),
+    sem_VST  = sd(VST, na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+p_comp_dot <- ggplot(comp_summary, aes(x = Condition, y = mean_VST, color = Condition)) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean_VST - sem_VST, ymax = mean_VST + sem_VST), width = 0.3) +
+  facet_wrap(~ SYMBOL, scales = "free_y", ncol = 5) +
+  scale_color_manual(values = c(
+    isotype     = "grey50",
+    WT          = "#4DAF4A",
+    WT_Exatecan = "#3B7DC6",
+    WT_MMAE     = "#C65D3B"
+  )) +
+  labs(
+    x = NULL, y = "VST expression",
+    title = "Complement gene expression across conditions"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x     = element_text(angle = 35, hjust = 1, size = 7),
+    strip.text      = element_text(face = "bold", size = 8),
+    legend.position = "none"
+  )
+
+p_comp_dot
+
+tiff(
+  file.path(results_dir, "Supp_Complement_dotplot_all_conditions.tiff"),
+  width = 14, height = 10, units = "in", res = 600, compression = "lzw"
+)
+print(p_comp_dot)
+dev.off()
+```
+
+```{r session-info}
+sessionInfo()
+```
